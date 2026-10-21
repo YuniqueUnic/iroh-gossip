@@ -239,15 +239,51 @@ reaping portion; it deliberately does not copy #146's dial-failure peer deletion
 because that would discard the pending queue before a later route/intention can
 retry.
 
-As verified on 2026-10-04, the latest stable release remains `v0.101.0` at
-`2ce78afe09d89d41d123f28eac19bdc831609cc8`. Upstream `main` is now
-[`2885dd9f1120e46aca5acbcd7f212e4c64e278b9`](https://github.com/n0-computer/iroh-gossip/commit/2885dd9f1120e46aca5acbcd7f212e4c64e278b9),
-three commits beyond that release. Those commits change scheduled CI, CI
-security configuration, the dependency lockfile, and one redundant borrow in
-the simulation binary. The network actor and protocol sources are unchanged
-from the stable baseline; none of these commits replaces the local ownership
-or disconnect fixes. The fork therefore retains the latest stable source
-baseline and the existing behavioral patches.
+As verified on 2026-10-21, the latest stable remains `v0.101.0` at
+`2ce78afe09d89d41d123f28eac19bdc831609cc8`. Upstream main has advanced to
+`c5f44db74ccc232d4e81523117b7e95e36d4c5c5`, with runtime/peer/connection lifecycle,
+rejoin, oversize-message and blocked-actor fixes, and new non-exhaustive APIs.
+It is no longer source-identical to the release. These unreleased changes do
+not fully replace the retained-message, explicit dial ownership, deterministic
+external handoff, or joined child-task shutdown contracts. This fork keeps the
+stable baseline and uses Iroh/base/noq 1.4; it does not import all unreleased main.
+
+External connection ownership now belongs to a non-cloneable reservation guard.
+Each Reserve carries a terminal oneshot receiver; the actor registers it before
+acknowledging Reserve. Dropping the guard closes that receiver, including when
+Reserve acknowledgement is cancelled. Handoff sends its authenticated connection
+and admission reply through that same terminal channel. No operation holds shared
+mailbox capacity, so long-running reservations cannot block inbound or shutdown
+commands. The actor polls terminal futures directly, without a background task.
+Each operation has a unique token retained independently of live connection state.
+After a cancelled actor dial is reaped, a pending actor-owned intent is rescheduled;
+releasing an external reservation before reap cannot lose that intent.
+
+Handoff returns the selected live connection, which may be an existing preferred
+connection. The actor retains its registered live handles alongside connection
+tasks so a rejected duplicate never becomes the consumer's cached connection.
+The old manual release and unacknowledged outgoing handoff APIs are removed.
+
+2026-10-21 validation on macOS aarch64 with Rust 1.98.1:
+
+- Standalone `mbx +1.98.1 test --locked --lib --all-features net::tests`:
+  32 passed, covering disconnect retirement, sender handoff, reconnect, and
+  cancellation/concurrent shutdown ownership. Existing fixtures were adapted to
+  operation tokens without removing behavioral assertions.
+- Standalone `mbx +1.98.1 clippy --locked --all-targets --all-features --no-deps -- -D warnings`:
+  passed.
+- Consumer suites: syzygy-net 86, syzygy-net-discovery 79,
+  syzygy-net-node-runtime 57, syzygy-net-transport 53 passed.
+- A real localhost QUIC driver cancelled a Reserve acknowledgement, kept 40
+  reservations alive together, released two same-peer operations independently,
+  delivered broadcasts after acknowledged handoff, and reused the preferred
+  connection for a reverse dial and reverse broadcast. Routers joined and both
+  original UDP ports rebound while Endpoint handles were retained.
+- Evidence: parent `tmp/evaluation/iroh-upgrade-20261021/`. No new installed-app,
+  commercial-role cross-device E2E, or non-macOS runtime validation was performed.
+
+Official comparison:
+https://github.com/n0-computer/iroh-gossip/compare/2ce78afe09d89d41d123f28eac19bdc831609cc8...c5f44db74ccc232d4e81523117b7e95e36d4c5c5
 
 This local patch is not a substitute for an upstream PR. Before removing it,
 an upstream release must provide all observable guarantees: unfinished initial

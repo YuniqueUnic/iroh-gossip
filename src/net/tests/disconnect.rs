@@ -53,11 +53,14 @@ impl Fixture {
         let (active_send_tx, receiver) = mpsc::channel(SEND_QUEUE_CAP);
         self.actor.peers.insert(
             self.peer,
-            PeerState::Active {
-                active_send_tx,
-                active_conn_id: conn_id,
-                active_origin: ConnOrigin::Dial,
-                other_conns: Vec::new(),
+            PeerState {
+                external_reservations: HashSet::new(),
+                connection: PeerConnectionState::Active {
+                    active_send_tx,
+                    active_conn_id: conn_id,
+                    active_origin: ConnOrigin::Dial,
+                    other_conns: Vec::new(),
+                },
             },
         );
         receiver
@@ -186,9 +189,13 @@ async fn failed_first_join_keeps_its_pending_dial_intent() {
             Instant::now(),
         )
         .await;
-    let Some(PeerState::Pending {
-        queue,
-        dial_ownership,
+    let Some(PeerState {
+        connection:
+            PeerConnectionState::Pending {
+                queue,
+                dial_ownership,
+            },
+        ..
     }) = fixture.actor.peers.get(&fixture.peer)
     else {
         panic!("a first Join must remain pending until its connection succeeds");
@@ -213,9 +220,12 @@ async fn disconnect_preserves_external_ownership_but_discards_retired_messages()
     fixture.events.try_recv().unwrap();
     fixture.actor.peers.insert(
         fixture.peer,
-        PeerState::Pending {
-            queue: vec![test_proto_message()],
-            dial_ownership: DialOwnership::External,
+        PeerState {
+            external_reservations: HashSet::from([ReservationId(1)]),
+            connection: PeerConnectionState::Pending {
+                queue: vec![test_proto_message()],
+                dial_ownership: DialOwnership::Idle,
+            },
         },
     );
 
@@ -228,9 +238,10 @@ async fn disconnect_preserves_external_ownership_but_discards_retired_messages()
         ProtoEvent::NeighborDown(fixture.peer)
     );
     assert!(
-        matches!(fixture.actor.peers.get(&fixture.peer), Some(PeerState::Pending {
-        queue, dial_ownership: DialOwnership::External,
-    }) if queue.is_empty())
+        matches!(fixture.actor.peers.get(&fixture.peer), Some(PeerState {
+            external_reservations,
+            connection: PeerConnectionState::Pending { queue, dial_ownership: DialOwnership::Idle },
+        }) if queue.is_empty() && external_reservations == &HashSet::from([ReservationId(1)]))
     );
     fixture
         .actor
@@ -240,9 +251,10 @@ async fn disconnect_preserves_external_ownership_but_discards_retired_messages()
         )
         .await;
     assert!(
-        matches!(fixture.actor.peers.get(&fixture.peer), Some(PeerState::Pending {
-        queue, dial_ownership: DialOwnership::External,
-    }) if queue.len() == 1)
+        matches!(fixture.actor.peers.get(&fixture.peer), Some(PeerState {
+            external_reservations,
+            connection: PeerConnectionState::Pending { queue, dial_ownership: DialOwnership::Idle },
+        }) if queue.len() == 1 && external_reservations == &HashSet::from([ReservationId(1)]))
     );
     assert!(fixture.actor.dialer.pending_dials.is_empty());
     fixture.shutdown().await;

@@ -143,6 +143,7 @@ impl Fixture {
             inner: Arc::new(Inner {
                 api: GossipApi::local(rpc_tx),
                 local_tx,
+                next_reservation_id: AtomicU64::new(0),
                 actor_handle: Mutex::new(None),
                 actor: Arc::new(Mutex::new(None)),
                 max_message_size,
@@ -362,12 +363,15 @@ async fn cancelled_recovery_waiter_keeps_the_actor_after_task_join() {
     // observe task completion even when sending its request cannot finish.
     for _ in 0..fixture.gossip.inner.local_tx.capacity() {
         let (reply, _) = oneshot::channel();
+        let (_, terminal) = oneshot::channel();
         fixture
             .gossip
             .inner
             .local_tx
             .try_send(LocalActorMessage::ReserveExternalConnection {
                 peer_id: fixture.peer_endpoint.id(),
+                reservation_id: ReservationId(0),
+                terminal,
                 reply,
             })
             .unwrap();
