@@ -1,7 +1,7 @@
 //! Networking for the `iroh-gossip` protocol
 
 use std::{
-    collections::{hash_map::Entry, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     panic::AssertUnwindSafe,
     pin::Pin,
@@ -37,12 +37,17 @@ use self::{
     util::{RecvLoop, SendLoop, Timers},
 };
 use crate::{
-    api::{self, Command, Event, GossipApi, RpcMessage},
+    api::{self, Command, Event, GossipApi, Neighbor, RpcMessage},
     metrics::Metrics,
     proto::{self, state::MessageKind, HyparviewConfig, PeerData, PlumtreeConfig, Scope, TopicId},
 };
 
 mod address_lookup;
+mod admission;
+mod shutdown;
+
+use admission::{Admission, AuthenticatedConnection, ConnectionRegistry};
+use shutdown::GossipShutdown;
 mod util;
 
 /// ALPN protocol name
@@ -75,6 +80,16 @@ pub(crate) struct ConnectionMessage {
     peer_id: EndpointId,
     conn_id: ConnId,
     message: ProtoMessage,
+}
+
+/// Application authentication runs before a connection enters gossip membership.
+pub trait ConnectionAuthenticator: std::fmt::Debug + Send + Sync + 'static {
+    /// Authenticate this TLS connection and return the application principal's
+    /// public key. Dropping this future cancels its exchange.
+    fn authenticate<'a>(
+        &'a self,
+        connection: &'a Connection,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<PublicKey, AcceptError>> + Send + 'a>>;
 }
 
 /// Publish and subscribe on gossiping topics.
@@ -110,7 +125,7 @@ impl std::ops::Deref for Gossip {
 #[derive(Debug)]
 enum LocalActorMessage {
     HandleConnection {
-        conn: Connection,
+        conn: AuthenticatedConnection,
         origin: ConnOrigin,
     },
     ReserveExternalConnection {
@@ -125,9 +140,15 @@ enum LocalActorMessage {
 }
 
 #[allow(missing_docs)]
-#[stack_error(derive, add_meta)]
+#[stack_error(derive, add_meta, from_sources)]
 #[non_exhaustive]
 pub enum Error {
+    Authentication {
+        source: AcceptError,
+    },
+    Dial {
+        source: iroh::endpoint::ConnectError,
+    },
     ActorDropped {},
     UnexpectedPeer {},
     ConnectionRejected {},
@@ -151,6 +172,8 @@ impl From<oneshot::error::RecvError> for Error {
 pub struct ExternalConnectionReservation {
     peer_id: EndpointId,
     terminal: oneshot::Sender<ExternalConnectionHandoff>,
+    connections: ConnectionRegistry,
+    authenticator: Option<Arc<dyn ConnectionAuthenticator>>,
 }
 
 impl ExternalConnectionReservation {
@@ -158,8 +181,13 @@ impl ExternalConnectionReservation {
     /// connection selected by the actor, including an already preferred connection.
     pub async fn handoff(self, conn: Connection) -> Result<Connection, Error> {
         if conn.remote_id() != self.peer_id {
+            conn.close(0u32.into(), b"unexpected gossip endpoint");
             return Err(e!(Error::UnexpectedPeer));
         }
+        let conn = self
+            .connections
+            .authenticate(conn, self.authenticator.as_deref())
+            .await?;
         let (reply, reply_rx) = oneshot::channel();
         self.terminal
             .send(ExternalConnectionHandoff { conn, reply })
@@ -170,7 +198,7 @@ impl ExternalConnectionReservation {
 
 #[derive(Debug)]
 struct ExternalConnectionHandoff {
-    conn: Connection,
+    conn: AuthenticatedConnection,
     reply: oneshot::Sender<Result<Connection, Error>>,
 }
 
@@ -202,12 +230,14 @@ pub(crate) struct Inner {
     api: GossipApi,
     local_tx: mpsc::Sender<LocalActorMessage>,
     next_reservation_id: AtomicU64,
-    actor_handle: Mutex<Option<AbortOnDropHandle<()>>>,
+    shutdown: Mutex<GossipShutdown>,
     // Keep the actor available for cleanup even if its task is cancelled or panics.
     #[debug(skip)]
     actor: Arc<Mutex<Option<Actor>>>,
     max_message_size: usize,
     metrics: Arc<Metrics>,
+    authenticator: Option<Arc<dyn ConnectionAuthenticator>>,
+    connections: ConnectionRegistry,
 }
 
 impl ProtocolHandler for Gossip {
@@ -230,9 +260,20 @@ impl ProtocolHandler for Gossip {
 pub struct Builder {
     config: proto::Config,
     alpn: Option<Bytes>,
+    authenticator: Option<Arc<dyn ConnectionAuthenticator>>,
 }
 
 impl Builder {
+    /// Authenticate incoming, external and actor-dialed connections before they
+    /// affect membership. Without a hook, the TLS endpoint key is the principal.
+    pub fn connection_authenticator(
+        mut self,
+        authenticator: Arc<dyn ConnectionAuthenticator>,
+    ) -> Self {
+        self.authenticator = Some(authenticator);
+        self
+    }
+
     /// Sets the maximum message size in bytes.
     /// By default this is `4096` bytes.
     pub fn max_message_size(mut self, size: usize) -> Self {
@@ -283,9 +324,11 @@ impl Builder {
             metrics.clone(),
             self.alpn,
             address_lookup,
+            self.authenticator.clone(),
         );
         let me = actor.endpoint.id().fmt_short();
         let max_message_size = actor.state.max_message_size();
+        let connections = actor.connections.clone();
 
         let actor = Arc::new(Mutex::new(Some(actor)));
         let actor_handle =
@@ -298,10 +341,14 @@ impl Builder {
                 api,
                 local_tx,
                 next_reservation_id: AtomicU64::new(0),
-                actor_handle: Mutex::new(Some(AbortOnDropHandle::new(actor_handle))),
+                shutdown: Mutex::new(GossipShutdown::Running(AbortOnDropHandle::new(
+                    actor_handle,
+                ))),
                 actor,
                 max_message_size,
                 metrics,
+                authenticator: self.authenticator,
+                connections,
             }
             .into(),
         }
@@ -314,6 +361,7 @@ impl Gossip {
         Builder {
             config: Default::default(),
             alpn: None,
+            authenticator: None,
         }
     }
 
@@ -328,10 +376,21 @@ impl Gossip {
         self.inner.max_message_size
     }
 
+    /// The principal authenticated and admitted for this exact connection.
+    /// Pending authentication or an endpoint match alone is not evidence.
+    pub fn authenticated_principal(&self, connection: &Connection) -> Option<PublicKey> {
+        self.inner.connections.principal(connection)
+    }
+
     /// Handle an incoming [`Connection`].
     ///
     /// Make sure to check the ALPN protocol yourself before passing the connection.
     pub async fn handle_connection(&self, conn: Connection) -> Result<(), Error> {
+        let conn = self
+            .inner
+            .connections
+            .authenticate(conn, self.inner.authenticator.as_deref())
+            .await?;
         self.inner
             .local_tx
             .send(LocalActorMessage::HandleConnection {
@@ -350,7 +409,12 @@ impl Gossip {
         peer_id: EndpointId,
     ) -> Result<ExternalConnectionReservation, Error> {
         let (terminal, terminal_rx) = oneshot::channel();
-        let reservation = ExternalConnectionReservation { peer_id, terminal };
+        let reservation = ExternalConnectionReservation {
+            peer_id,
+            terminal,
+            authenticator: self.inner.authenticator.clone(),
+            connections: self.inner.connections.clone(),
+        };
         let reservation_id = ReservationId(
             self.inner
                 .next_reservation_id
@@ -376,48 +440,14 @@ impl Gossip {
     /// stops the gossip actor loop and drops all state and connections.
     /// On native platforms, the actor and its connection, forwarding, and dial
     /// tasks are joined before this returns, including when the request fails.
+    /// Repeated and concurrent calls observe the same operation and its result.
     pub async fn shutdown(&self) -> Result<(), Error> {
-        // Borrow the handle until it finishes: cancelling this waiter must not
-        // abort the actor or remove the only handle another waiter can join.
-        let mut actor_handle = self.inner.actor_handle.lock().await;
-        let request = async {
-            let (reply, reply_rx) = oneshot::channel();
-            self.inner
-                .local_tx
-                .send(LocalActorMessage::Shutdown { reply })
-                .await?;
-            reply_rx.await?;
-            Ok::<_, Error>(())
-        };
-        tokio::pin!(request);
-        let (request_result, task_result) = if let Some(handle) = actor_handle.as_mut() {
-            // An abnormal task exit can leave the actor's receiver alive in
-            // `Inner`, so neither sending nor receiving the RPC may finish.
-            let results = tokio::select! {
-                biased;
-                result = &mut request => (Some(result), (&mut *handle).await),
-                result = &mut *handle => (None, result),
-            };
-            *actor_handle = None;
-            results
-        } else {
-            (Some(Err(e!(Error::ActorDropped))), Ok(()))
-        };
-
-        // A panic or cancellation outside the event loop must not strand the
-        // actor's children. Keep its owner in place across this await as well.
-        let mut actor = self.inner.actor.lock().await;
-        if let Some(actor) = actor.as_mut() {
-            actor.shutdown_tasks().await;
-        }
-        drop(actor.take());
-        // Joining may win the select just after a successful reply is sent.
-        // With the actor dropped, a pending request now resolves in every case.
-        let request_result = match request_result {
-            Some(result) => result,
-            None => request.await,
-        };
-        request_result.and(task_result.map_err(|_| e!(Error::ActorDropped)))
+        self.inner
+            .shutdown
+            .lock()
+            .await
+            .finish(&self.inner.local_tx, &self.inner.actor)
+            .await
     }
 
     /// Returns the metrics tracked for this gossip instance.
@@ -450,7 +480,7 @@ struct Actor {
     /// Map of peers to their state.
     peers: HashMap<EndpointId, PeerState>,
     // Live handles registered with connection_tasks; peer state refers to stable ids.
-    connections: HashMap<ConnId, Connection>,
+    connections: ConnectionRegistry,
     external_connections: FuturesUnordered<ExternalConnectionCompletion>,
     /// Stream of commands from topic handles.
     command_rx: stream_group::Keyed<TopicCommandStream>,
@@ -470,13 +500,15 @@ impl Actor {
         metrics: Arc<Metrics>,
         alpn: Option<Bytes>,
         address_lookup: GossipAddressLookup,
+        authenticator: Option<Arc<dyn ConnectionAuthenticator>>,
     ) -> (
         Self,
         mpsc::Sender<RpcMessage>,
         mpsc::Sender<LocalActorMessage>,
     ) {
         let peer_id = endpoint.id();
-        let dialer = Dialer::new(endpoint.clone());
+        let connections = ConnectionRegistry::default();
+        let dialer = Dialer::new(endpoint.clone(), authenticator, connections.clone());
         let state = proto::State::new(
             peer_id,
             Default::default(),
@@ -498,7 +530,7 @@ impl Actor {
             timers: Timers::new(),
             command_rx: StreamGroup::new().keyed(),
             peers: Default::default(),
-            connections: Default::default(),
+            connections,
             external_connections: Default::default(),
             topics: Default::default(),
             quit_queue: Default::default(),
@@ -542,6 +574,7 @@ impl Actor {
     }
 
     async fn shutdown_tasks(&mut self) {
+        self.connections.seal_and_close();
         // Cancel every group before waiting for any one of them. Joining errors
         // in one group must not prevent cleanup of the remaining groups.
         self.connection_tasks.abort_all();
@@ -551,7 +584,6 @@ impl Actor {
         self.topic_event_forwarders.shutdown().await;
         self.dialer.pending.shutdown().await;
         self.external_connections = FuturesUnordered::new();
-        self.connections.clear();
     }
 
     /// Performs the initial actor setup to run the [`Actor::event_loop`].
@@ -587,7 +619,7 @@ impl Actor {
                         return false;
                     },
                     Some(LocalActorMessage::HandleConnection { conn, origin }) => {
-                        let peer_id = conn.remote_id();
+                        let peer_id = conn.connection().remote_id();
                         if connection_supersedes_actor_dial(self.endpoint.id(), peer_id, origin) {
                             self.dialer.cancel_dial(peer_id);
                         }
@@ -771,14 +803,48 @@ impl Actor {
         self.connections
             .get(active_conn_id)
             .filter(|connection| connection.close_reason().is_none())
-            .cloned()
     }
 
     fn handle_connection(
         &mut self,
         peer_id: EndpointId,
         origin: ConnOrigin,
+        conn: AuthenticatedConnection,
+    ) -> Result<Connection, Error> {
+        let admission = conn.claim()?;
+        let principal = match &admission {
+            Admission::Owned(principal) | Admission::Resolved(principal) => *principal,
+        };
+        // Compare before both closed-candidate fallback and duplicate reuse.
+        let conflicting = matches!(self.peers.get(&peer_id),
+            Some(PeerState { connection: PeerConnectionState::Active { principal: existing, .. }, .. })
+            if *existing != principal)
+            || self.topics.values().any(|topic| {
+                topic
+                    .neighbors
+                    .get(&peer_id)
+                    .is_some_and(|neighbor| neighbor.principal != principal)
+            });
+        let result = if conflicting {
+            conn.connection()
+                .close(0u32.into(), b"gossip endpoint principal changed");
+            Err(e!(Error::UnexpectedPeer))
+        } else if matches!(admission, Admission::Resolved(_)) {
+            self.active_connection(peer_id)
+                .ok_or_else(|| e!(Error::ConnectionRejected))
+        } else {
+            self.admit_verified_connection(peer_id, origin, conn.connection().clone(), principal)
+        };
+        self.connections.finish(&conn, &result);
+        result
+    }
+
+    fn admit_verified_connection(
+        &mut self,
+        peer_id: EndpointId,
+        origin: ConnOrigin,
         conn: Connection,
+        principal: PublicKey,
     ) -> Result<Connection, Error> {
         if conn.close_reason().is_some() {
             return self
@@ -793,12 +859,13 @@ impl Actor {
             Entry::Occupied(mut entry) => {
                 entry
                     .get_mut()
-                    .admit_conn(send_tx, conn_id, origin, preferred_origin)
+                    .admit_conn(send_tx, conn_id, origin, preferred_origin, principal)
             }
             Entry::Vacant(entry) => {
                 entry.insert(PeerState {
                     external_reservations: HashSet::new(),
                     connection: PeerConnectionState::Active {
+                        principal,
                         active_send_tx: send_tx,
                         active_conn_id: conn_id,
                         active_origin: origin,
@@ -837,7 +904,6 @@ impl Actor {
         let max_message_size = self.state.max_message_size();
         let in_event_tx = self.in_event_tx.clone();
 
-        self.connections.insert(conn_id, conn.clone());
         let activated = conn.clone();
         // Spawn a task for this connection
         self.connection_tasks.spawn(
@@ -887,9 +953,15 @@ impl Actor {
                     .peers
                     .get_mut(&peer_id)
                     .is_some_and(PeerState::preserve_external_reservation_after_disconnect);
-                if !preserve_reservation {
-                    self.peers.remove(&peer_id);
+                if preserve_reservation {
+                    // The peer may close its old sender after authenticating its
+                    // side of our replacement, before our handoff reaches this
+                    // actor. The existing operation owns that transition. Only
+                    // its terminal failure may retire the logical membership.
+                    debug!("old connection closed during external handoff");
+                    return;
                 }
+                self.peers.remove(&peer_id);
                 debug!("active send connection closed, mark peer as disconnected");
                 self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now());
             }
@@ -924,7 +996,7 @@ impl Actor {
                 } = self.topics.entry(topic_id).or_default();
                 let mut sender_dead = false;
                 if !neighbors.is_empty() {
-                    for neighbor in neighbors.iter() {
+                    for neighbor in neighbors.values() {
                         if let Err(_err) = tx.try_send(Event::NeighborUp(*neighbor)).await {
                             sender_dead = true;
                             break;
@@ -1031,6 +1103,13 @@ impl Actor {
                             self.dialer.queue_dial(peer_id, self.alpn.clone());
                         }
                         PeerSendOutcome::ReconnectQueued => {
+                            if !state.external_reservations.is_empty() {
+                                // This is the same physical closure observed by
+                                // connection_tasks. The outstanding handoff still
+                                // owns the logical neighbor and this queued frame.
+                                debug!(peer = %peer_id.fmt_short(), "sender closed during external handoff");
+                                continue;
+                            }
                             warn!(
                                 peer = %peer_id.fmt_short(),
                                 "connection send loop terminated; retire protocol connection",
@@ -1061,15 +1140,40 @@ impl Actor {
                         event_sender,
                         ..
                     } = state;
-                    match &event {
-                        ProtoEvent::NeighborUp(neighbor) => {
-                            neighbors.insert(*neighbor);
+                    let event = match event {
+                        ProtoEvent::NeighborUp(endpoint_id) => {
+                            let Some(PeerState {
+                                connection: PeerConnectionState::Active { principal, .. },
+                                ..
+                            }) = self.peers.get(&endpoint_id)
+                            else {
+                                warn!(%endpoint_id, "membership has no admitted connection");
+                                out.extend(self.state.handle(
+                                    InEvent::PeerDisconnected(endpoint_id),
+                                    now,
+                                    Some(&self.metrics),
+                                ));
+                                continue;
+                            };
+                            let neighbor = Neighbor {
+                                endpoint_id,
+                                principal: *principal,
+                            };
+                            neighbors.insert(endpoint_id, neighbor);
+                            Event::NeighborUp(neighbor)
                         }
-                        ProtoEvent::NeighborDown(neighbor) => {
-                            neighbors.remove(neighbor);
+                        ProtoEvent::NeighborDown(endpoint_id) => {
+                            let Some(neighbor) = neighbors.remove(&endpoint_id) else {
+                                continue;
+                            };
+                            Event::NeighborDown(neighbor)
                         }
-                        _ => {}
-                    }
+                        ProtoEvent::Received(message) => Event::Received(api::Message {
+                            content: message.content,
+                            scope: message.scope,
+                            delivered_from: message.delivered_from,
+                        }),
+                    };
                     event_sender.send(event).ok();
                     if !state.still_needed() {
                         self.quit_queue.push_back(topic_id);
@@ -1131,10 +1235,53 @@ impl Actor {
         match release {
             ExternalConnectionRelease::Retry => {
                 debug!(peer = %peer_id.fmt_short(), "external dial failed; resume actor-owned dial");
-                self.dialer.queue_dial(peer_id, self.alpn.clone());
+                let mut topics = self
+                    .topics
+                    .iter()
+                    .filter_map(|(topic, state)| {
+                        state.neighbors.contains_key(&peer_id).then_some(*topic)
+                    })
+                    .collect::<BTreeSet<_>>();
+                if topics.is_empty() {
+                    // An initial Join already owns its queued protocol intent.
+                    self.dialer.queue_dial(peer_id, self.alpn.clone());
+                } else {
+                    // Another topic may have its first explicit Join queued on
+                    // this same physical connection. Retiring the old neighbor
+                    // must not erase that independent application intent.
+                    if let Some(PeerState {
+                        connection: PeerConnectionState::Pending { queue, .. },
+                        ..
+                    }) = self.peers.get(&peer_id)
+                    {
+                        topics.extend(queue.iter().filter_map(|message| {
+                            message.message.is_join().then_some(message.topic)
+                        }));
+                    }
+                    // The old neighbor was retained only for the handoff. Its
+                    // failure ends that generation: raw data alone cannot rebuild
+                    // the remote membership. Reuse the protocol's Join operation.
+                    self.peers.remove(&peer_id);
+                    let now = Instant::now();
+                    self.handle_in_event(InEvent::PeerDisconnected(peer_id), now);
+                    for topic in topics {
+                        if !self
+                            .topics
+                            .get(&topic)
+                            .is_some_and(TopicState::still_needed)
+                        {
+                            continue;
+                        }
+                        self.handle_in_event(
+                            InEvent::Command(topic, ProtoCommand::Join(vec![peer_id])),
+                            now,
+                        );
+                    }
+                }
             }
             ExternalConnectionRelease::Remove => {
                 self.peers.remove(&peer_id);
+                self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now());
             }
             ExternalConnectionRelease::None => {}
         }
@@ -1158,6 +1305,7 @@ enum PeerConnectionState {
         dial_ownership: DialOwnership,
     },
     Active {
+        principal: PublicKey,
         active_send_tx: mpsc::Sender<ProtoMessage>,
         active_conn_id: ConnId,
         active_origin: ConnOrigin,
@@ -1313,11 +1461,13 @@ impl PeerState {
         conn_id: ConnId,
         origin: ConnOrigin,
         preferred_origin: ConnOrigin,
+        principal: PublicKey,
     ) -> PeerConnectionAdmission {
         match &mut self.connection {
             PeerConnectionState::Pending { queue, .. } => {
                 let queue = std::mem::take(queue);
                 self.connection = PeerConnectionState::Active {
+                    principal,
                     active_send_tx: send_tx,
                     active_conn_id: conn_id,
                     active_origin: origin,
@@ -1330,6 +1480,7 @@ impl PeerState {
                 active_conn_id,
                 active_origin,
                 other_conns,
+                ..
             } => {
                 if *active_conn_id == conn_id {
                     return PeerConnectionAdmission::AlreadyActive;
@@ -1363,8 +1514,8 @@ impl Default for PeerConnectionState {
 
 #[derive(Debug)]
 struct TopicState {
-    neighbors: BTreeSet<EndpointId>,
-    event_sender: broadcast::Sender<ProtoEvent>,
+    neighbors: BTreeMap<EndpointId, Neighbor>,
+    event_sender: broadcast::Sender<Event>,
     /// Keys identifying command receivers in [`Actor::command_rx`].
     ///
     /// This represents the receiver side of gossip's publish public API.
@@ -1505,7 +1656,7 @@ fn decode_peer_data(peer_data: &PeerData) -> Result<AddrInfo, postcard::Error> {
 
 async fn topic_subscriber_loop(
     sender: irpc::channel::mpsc::Sender<Event>,
-    mut topic_events: broadcast::Receiver<ProtoEvent>,
+    mut topic_events: broadcast::Receiver<Event>,
 ) {
     loop {
         tokio::select! {
@@ -1514,7 +1665,7 @@ async fn topic_subscriber_loop(
                let event = match msg {
                    Err(broadcast::error::RecvError::Closed) => break,
                    Err(broadcast::error::RecvError::Lagged(_)) => Event::Lagged,
-                   Ok(event) => event.into(),
+                   Ok(event) => event,
                };
                if sender.send(event).await.is_err() {
                    break;
@@ -1567,18 +1718,23 @@ impl Stream for TopicCommandStream {
 #[derive(Debug)]
 struct Dialer {
     endpoint: Endpoint,
-    pending: JoinSet<(
-        EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
-    )>,
+    pending: JoinSet<(EndpointId, Option<Result<AuthenticatedConnection, Error>>)>,
+    authenticator: Option<Arc<dyn ConnectionAuthenticator>>,
     pending_dials: HashMap<EndpointId, CancellationToken>,
+    connections: ConnectionRegistry,
 }
 
 impl Dialer {
     /// Create a new dialer for a [`Endpoint`]
-    fn new(endpoint: Endpoint) -> Self {
+    fn new(
+        endpoint: Endpoint,
+        authenticator: Option<Arc<dyn ConnectionAuthenticator>>,
+        connections: ConnectionRegistry,
+    ) -> Self {
         Self {
             endpoint,
+            authenticator,
+            connections,
             pending: Default::default(),
             pending_dials: Default::default(),
         }
@@ -1592,12 +1748,17 @@ impl Dialer {
         let cancel = CancellationToken::new();
         self.pending_dials.insert(endpoint_id, cancel.clone());
         let endpoint = self.endpoint.clone();
+        let authenticator = self.authenticator.clone();
+        let connections = self.connections.clone();
         self.pending.spawn(
             async move {
                 let res = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
-                    res = endpoint.connect(endpoint_id, &alpn) => Some(res),
+                    res = async {
+                        let conn = endpoint.connect(endpoint_id, &alpn).await?;
+                        connections.authenticate(conn, authenticator.as_deref()).await
+                    } => Some(res),
                 };
                 (endpoint_id, res)
             }
@@ -1622,12 +1783,7 @@ impl Dialer {
 
     /// Waits for the next dial operation to complete.
     /// `None` means the actor-owned dial was cancelled by an external reservation.
-    async fn next_conn(
-        &mut self,
-    ) -> (
-        EndpointId,
-        Option<Result<Connection, iroh::endpoint::ConnectError>>,
-    ) {
+    async fn next_conn(&mut self) -> (EndpointId, Option<Result<AuthenticatedConnection, Error>>) {
         match self.pending_dials.is_empty() {
             false => {
                 let (endpoint_id, res) = loop {
@@ -1686,6 +1842,13 @@ pub(crate) mod tests {
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     mod disconnect;
 
+    fn tls_neighbor(endpoint_id: EndpointId) -> Neighbor {
+        Neighbor {
+            endpoint_id,
+            principal: endpoint_id,
+        }
+    }
+
     fn test_proto_message() -> ProtoMessage {
         let me = SecretKey::from_bytes(&[1u8; 32]).public();
         let peer = SecretKey::from_bytes(&[2u8; 32]).public();
@@ -1718,6 +1881,7 @@ pub(crate) mod tests {
         let mut state = PeerState {
             external_reservations: HashSet::new(),
             connection: PeerConnectionState::Active {
+                principal: SecretKey::from_bytes(&[2u8; 32]).public(),
                 active_send_tx,
                 active_conn_id: 7,
                 active_origin: ConnOrigin::Dial,
@@ -1846,6 +2010,7 @@ pub(crate) mod tests {
         let mut state = PeerState {
             external_reservations: HashSet::new(),
             connection: PeerConnectionState::Active {
+                principal: SecretKey::from_bytes(&[2u8; 32]).public(),
                 active_send_tx,
                 active_conn_id: 7,
                 active_origin: ConnOrigin::Accept,
@@ -1855,7 +2020,7 @@ pub(crate) mod tests {
         let (preferred_send_tx, _preferred_send_rx) = mpsc::channel(1);
 
         assert!(matches!(
-            state.admit_conn(preferred_send_tx, 8, ConnOrigin::Dial, ConnOrigin::Dial),
+            state.admit_conn(preferred_send_tx, 8, ConnOrigin::Dial, ConnOrigin::Dial, SecretKey::from_bytes(&[2u8; 32]).public()),
             PeerConnectionAdmission::Activate { queue } if queue.is_empty()
         ));
         let PeerConnectionState::Active {
@@ -1873,18 +2038,30 @@ pub(crate) mod tests {
 
         let (redundant_send_tx, _redundant_send_rx) = mpsc::channel(1);
         assert!(matches!(
-            state.admit_conn(redundant_send_tx, 9, ConnOrigin::Accept, ConnOrigin::Dial),
+            state.admit_conn(
+                redundant_send_tx,
+                9,
+                ConnOrigin::Accept,
+                ConnOrigin::Dial,
+                SecretKey::from_bytes(&[2u8; 32]).public()
+            ),
             PeerConnectionAdmission::Reject
         ));
         let (duplicate_send_tx, _duplicate_send_rx) = mpsc::channel(1);
         assert!(matches!(
-            state.admit_conn(duplicate_send_tx, 8, ConnOrigin::Dial, ConnOrigin::Dial),
+            state.admit_conn(
+                duplicate_send_tx,
+                8,
+                ConnOrigin::Dial,
+                ConnOrigin::Dial,
+                SecretKey::from_bytes(&[2u8; 32]).public()
+            ),
             PeerConnectionAdmission::AlreadyActive
         ));
 
         let (restart_send_tx, _restart_send_rx) = mpsc::channel(1);
         assert!(matches!(
-            state.admit_conn(restart_send_tx, 10, ConnOrigin::Dial, ConnOrigin::Dial),
+            state.admit_conn(restart_send_tx, 10, ConnOrigin::Dial, ConnOrigin::Dial, SecretKey::from_bytes(&[2u8; 32]).public()),
             PeerConnectionAdmission::Activate { queue } if queue.is_empty()
         ));
         let PeerConnectionState::Active {
@@ -1956,6 +2133,7 @@ pub(crate) mod tests {
         let mut state = PeerState {
             external_reservations: HashSet::new(),
             connection: PeerConnectionState::Active {
+                principal: SecretKey::from_bytes(&[2u8; 32]).public(),
                 active_send_tx,
                 active_conn_id: 7,
                 active_origin: ConnOrigin::Dial,
@@ -2047,16 +2225,26 @@ pub(crate) mod tests {
                 .expect("endpoint is not closed")
                 .add(address_lookup.clone());
 
-            let (actor, to_actor_tx, conn_tx) =
-                Actor::new(endpoint, config, metrics.clone(), None, address_lookup);
+            let (actor, to_actor_tx, conn_tx) = Actor::new(
+                endpoint,
+                config,
+                metrics.clone(),
+                None,
+                address_lookup,
+                None,
+            );
             let max_message_size = actor.state.max_message_size();
 
             let gossip = Self {
                 inner: Inner {
                     api: GossipApi::local(to_actor_tx),
                     local_tx: conn_tx,
+                    authenticator: None,
+                    connections: actor.connections.clone(),
                     next_reservation_id: AtomicU64::new(0),
-                    actor_handle: Mutex::new(None),
+                    shutdown: Mutex::new(GossipShutdown::Complete(
+                        super::shutdown::ShutdownOutcome::ActorDropped,
+                    )),
                     actor: Arc::new(Mutex::new(None)),
                     max_message_size,
                     metrics,
@@ -2088,7 +2276,8 @@ pub(crate) mod tests {
             let actor_handle = task::spawn(
                 Actor::run(g.inner.actor.clone()).instrument(tracing::error_span!("gossip", %me)),
             );
-            *g.inner.actor_handle.lock().await = Some(AbortOnDropHandle::new(actor_handle));
+            *g.inner.shutdown.lock().await =
+                GossipShutdown::Running(AbortOnDropHandle::new(actor_handle));
             Ok((g, ep, ep_handle))
         }
     }
@@ -2496,7 +2685,7 @@ pub(crate) mod tests {
         let ev = timeout(conn_timeout, sub.try_next())
             .await
             .std_context("wait neighbor down")??;
-        assert_eq!(ev, Some(Event::NeighborDown(endpoint_id2)));
+        assert_eq!(ev, Some(Event::NeighborDown(tls_neighbor(endpoint_id2))));
         tracing::info!("endpoint 2 left");
 
         // signal endpoint_2 to subscribe again
@@ -2506,7 +2695,7 @@ pub(crate) mod tests {
         let ev = timeout(conn_timeout, sub.try_next())
             .await
             .std_context("wait neighbor up")??;
-        assert_eq!(ev, Some(Event::NeighborUp(endpoint_id2)));
+        assert_eq!(ev, Some(Event::NeighborUp(tls_neighbor(endpoint_id2))));
         tracing::info!("endpoint 2 rejoined!");
 
         // cleanup and ensure everything went as expected
@@ -2777,12 +2966,12 @@ pub(crate) mod tests {
         let ev = timeout(Duration::from_secs(3), rx2.next())
             .await
             .std_context("wait rx2 neighbor")?;
-        assert!(matches!(ev, Some(Ok(Event::NeighborUp(n))) if n == n3));
+        assert!(matches!(ev, Some(Ok(Event::NeighborUp(n))) if n.endpoint_id == n3));
 
         let ev = timeout(Duration::from_secs(3), rx1.next())
             .await
             .std_context("wait rx1 neighbor")?;
-        assert!(matches!(ev, Some(Ok(Event::NeighborUp(n))) if n == n3));
+        assert!(matches!(ev, Some(Ok(Event::NeighborUp(n))) if n.endpoint_id == n3));
 
         tokio::try_join!(r1.shutdown(), r2.shutdown(), r3.shutdown())
             .std_context("shutdown routers")?;

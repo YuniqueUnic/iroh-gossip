@@ -116,6 +116,7 @@ impl Fixture {
             metrics.clone(),
             None,
             GossipAddressLookup::default(),
+            None,
         );
         let max_message_size = actor.state.max_message_size();
         let mut gates = vec![
@@ -143,8 +144,12 @@ impl Fixture {
             inner: Arc::new(Inner {
                 api: GossipApi::local(rpc_tx),
                 local_tx,
+                authenticator: None,
+                connections: actor.connections.clone(),
                 next_reservation_id: AtomicU64::new(0),
-                actor_handle: Mutex::new(None),
+                shutdown: Mutex::new(GossipShutdown::Complete(
+                    crate::net::shutdown::ShutdownOutcome::ActorDropped,
+                )),
                 actor: Arc::new(Mutex::new(None)),
                 max_message_size,
                 metrics,
@@ -164,7 +169,8 @@ impl Fixture {
         *self.gossip.inner.actor.lock().await = self.actor.take();
         let handle = task::spawn(Actor::run(self.gossip.inner.actor.clone()));
         let abort = handle.abort_handle();
-        *self.gossip.inner.actor_handle.lock().await = Some(AbortOnDropHandle::new(handle));
+        *self.gossip.inner.shutdown.lock().await =
+            GossipShutdown::Running(AbortOnDropHandle::new(handle));
         abort
     }
 
@@ -181,7 +187,10 @@ impl Fixture {
     }
 
     async fn assert_drained(self) {
-        assert!(self.gossip.inner.actor_handle.lock().await.is_none());
+        assert!(matches!(
+            *self.gossip.inner.shutdown.lock().await,
+            GossipShutdown::Complete(_)
+        ));
         assert!(self.gossip.inner.actor.lock().await.is_none());
         assert!(self.gossip.inner.local_tx.is_closed());
         assert!(self.gates.is_empty());
@@ -288,7 +297,8 @@ async fn failed_shutdown_reply_still_joins_actor_and_children() {
         task_finished.await.unwrap();
         // Leave the actor in its owner to exercise cleanup after task exit.
     });
-    *fixture.gossip.inner.actor_handle.lock().await = Some(AbortOnDropHandle::new(handle));
+    *fixture.gossip.inner.shutdown.lock().await =
+        GossipShutdown::Running(AbortOnDropHandle::new(handle));
     let gossip = fixture.gossip.clone();
     let mut shutdown = Box::pin(gossip.shutdown());
     assert_pending(shutdown.as_mut()).await;
@@ -308,7 +318,7 @@ async fn failed_shutdown_reply_still_joins_actor_and_children() {
 }
 
 #[tokio::test]
-async fn cancelled_shutdown_waiter_keeps_the_actor_handle() {
+async fn cancelled_shutdown_waiter_keeps_the_original_operation() {
     let mut fixture = Fixture::new().await;
     fixture.spawn().await;
     let gossip = fixture.gossip.clone();
@@ -316,14 +326,17 @@ async fn cancelled_shutdown_waiter_keeps_the_actor_handle() {
     assert_pending(shutdown.as_mut()).await;
     fixture.cancelled().await;
     drop(shutdown);
-    assert!(gossip.inner.actor_handle.lock().await.is_some());
+    assert!(matches!(
+        *gossip.inner.shutdown.lock().await,
+        GossipShutdown::Draining(_)
+    ));
 
     let mut shutdown = Box::pin(gossip.shutdown());
     assert_pending(shutdown.as_mut()).await;
     fixture.release_tasks().await;
-    // The first request was accepted; this later request loses its reply when
-    // the actor drops. It must still wait for the same real actor task.
-    assert!(timeout(WAIT, shutdown).await.unwrap().is_err());
+    // The second waiter resumes the first request, including its real reply,
+    // instead of manufacturing another request against the already stopped actor.
+    timeout(WAIT, shutdown).await.unwrap().unwrap();
     fixture.assert_drained().await;
 }
 
@@ -342,7 +355,7 @@ async fn concurrent_shutdown_callers_wait_for_the_same_actor() {
     assert_pending(second.as_mut()).await;
     fixture.release_tasks().await;
     timeout(WAIT, first).await.unwrap().unwrap();
-    assert!(timeout(WAIT, second).await.unwrap().is_err());
+    timeout(WAIT, second).await.unwrap().unwrap();
     fixture.assert_drained().await;
 }
 
@@ -384,8 +397,14 @@ async fn cancelled_recovery_waiter_keeps_the_actor_after_task_join() {
         () = fixture.cancelled() => {}
     }
     drop(shutdown);
-    assert!(gossip.inner.actor_handle.lock().await.is_none());
-    assert!(gossip.inner.actor.lock().await.is_some());
+    assert!(matches!(
+        *gossip.inner.shutdown.lock().await,
+        GossipShutdown::Draining(_)
+    ));
+    // The retained operation is suspended while joining the children and
+    // therefore still owns this cleanup lock. Observing it must not wait on
+    // the very operation this test intentionally paused.
+    assert!(gossip.inner.actor.try_lock().is_err());
 
     let mut shutdown = Box::pin(gossip.shutdown());
     assert_pending(shutdown.as_mut()).await;

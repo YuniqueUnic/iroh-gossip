@@ -5,7 +5,7 @@ struct Fixture {
     endpoint: Endpoint,
     peer: EndpointId,
     topic: TopicId,
-    events: broadcast::Receiver<ProtoEvent>,
+    events: broadcast::Receiver<Event>,
     _rpc_tx: mpsc::Sender<RpcMessage>,
     _local_tx: mpsc::Sender<LocalActorMessage>,
 }
@@ -27,6 +27,7 @@ impl Fixture {
             Arc::new(Metrics::default()),
             None,
             GossipAddressLookup::default(),
+            None,
         );
         let topic = TopicId::from_bytes([3u8; 32]);
         let topic_state = TopicState::default();
@@ -54,6 +55,7 @@ impl Fixture {
             PeerState {
                 external_reservations: HashSet::new(),
                 connection: PeerConnectionState::Active {
+                    principal: self.peer,
                     active_send_tx,
                     active_conn_id: conn_id,
                     active_origin: ConnOrigin::Dial,
@@ -105,7 +107,7 @@ async fn failed_active_send_retires_membership_before_more_broadcasts() {
     fixture.receive_join(7).await;
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborUp(fixture.peer)
+        Event::NeighborUp(tls_neighbor(fixture.peer))
     );
     while old_outbound.try_recv().is_ok() {}
     drop(old_outbound);
@@ -113,12 +115,12 @@ async fn failed_active_send_retires_membership_before_more_broadcasts() {
     fixture.broadcast(Bytes::from_static(b"send-fails"));
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborDown(fixture.peer)
+        Event::NeighborDown(tls_neighbor(fixture.peer))
     );
     assert!(!fixture.actor.peers.contains_key(&fixture.peer));
     assert!(!fixture.actor.topics[&fixture.topic]
         .neighbors
-        .contains(&fixture.peer));
+        .contains_key(&fixture.peer));
     for seq in 0..12 {
         fixture.broadcast(Bytes::from(format!("offline-{seq}")));
     }
@@ -133,7 +135,7 @@ async fn failed_active_send_retires_membership_before_more_broadcasts() {
     fixture.receive_join(8).await;
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborUp(fixture.peer)
+        Event::NeighborUp(tls_neighbor(fixture.peer))
     );
     while outbound.try_recv().is_ok() {}
     fixture.broadcast(Bytes::from_static(b"after-rejoin"));
@@ -225,7 +227,7 @@ async fn disconnect_preserves_external_ownership_but_discards_retired_messages()
         .handle_in_event(InEvent::PeerDisconnected(fixture.peer), Instant::now());
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborDown(fixture.peer)
+        Event::NeighborDown(tls_neighbor(fixture.peer))
     );
     assert!(
         matches!(fixture.actor.peers.get(&fixture.peer), Some(PeerState {
@@ -276,7 +278,7 @@ async fn queued_input_from_a_failed_sender_cannot_restore_retired_membership() {
     assert!(!fixture.actor.peers.contains_key(&fixture.peer));
     assert!(!fixture.actor.topics[&fixture.topic]
         .neighbors
-        .contains(&fixture.peer));
+        .contains_key(&fixture.peer));
     assert!(fixture.events.try_recv().is_err());
     fixture.shutdown().await;
 }
@@ -330,7 +332,13 @@ async fn queued_neighbor_reply_survives_sender_handoff() {
         .peers
         .get_mut(&fixture.peer)
         .unwrap()
-        .admit_conn(new_sender, 8, ConnOrigin::Accept, ConnOrigin::Accept);
+        .admit_conn(
+            new_sender,
+            8,
+            ConnOrigin::Accept,
+            ConnOrigin::Accept,
+            fixture.peer,
+        );
     assert!(matches!(
         admission,
         PeerConnectionAdmission::Activate { .. }
@@ -343,7 +351,7 @@ async fn queued_neighbor_reply_survives_sender_handoff() {
     );
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborUp(fixture.peer)
+        Event::NeighborUp(tls_neighbor(fixture.peer))
     );
     let reply = new_outbound
         .try_recv()
@@ -368,7 +376,13 @@ async fn closed_handoff_connection_input_is_rejected_while_current_input_still_w
         .peers
         .get_mut(&fixture.peer)
         .unwrap()
-        .admit_conn(new_sender, 8, ConnOrigin::Dial, ConnOrigin::Dial);
+        .admit_conn(
+            new_sender,
+            8,
+            ConnOrigin::Dial,
+            ConnOrigin::Dial,
+            fixture.peer,
+        );
     assert!(matches!(
         admission,
         PeerConnectionAdmission::Activate { .. }
@@ -393,7 +407,7 @@ async fn closed_handoff_connection_input_is_rejected_while_current_input_still_w
     fixture.receive_join(8).await;
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborUp(fixture.peer)
+        Event::NeighborUp(tls_neighbor(fixture.peer))
     );
     fixture.shutdown().await;
 }
@@ -410,7 +424,13 @@ async fn retired_handoff_connections_cannot_restore_membership_after_reconnect()
         .peers
         .get_mut(&fixture.peer)
         .unwrap()
-        .admit_conn(new_sender, 8, ConnOrigin::Dial, ConnOrigin::Dial);
+        .admit_conn(
+            new_sender,
+            8,
+            ConnOrigin::Dial,
+            ConnOrigin::Dial,
+            fixture.peer,
+        );
     assert!(matches!(
         admission,
         PeerConnectionAdmission::Activate { .. }
@@ -421,7 +441,7 @@ async fn retired_handoff_connections_cannot_restore_membership_after_reconnect()
         .handle_in_event(InEvent::PeerDisconnected(fixture.peer), Instant::now());
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborDown(fixture.peer)
+        Event::NeighborDown(tls_neighbor(fixture.peer))
     );
     assert!(!fixture.actor.peers.contains_key(&fixture.peer));
     let _reconnected_outbound = fixture.activate_sender(9);
@@ -430,12 +450,12 @@ async fn retired_handoff_connections_cannot_restore_membership_after_reconnect()
         assert!(fixture.events.try_recv().is_err());
         assert!(!fixture.actor.topics[&fixture.topic]
             .neighbors
-            .contains(&fixture.peer));
+            .contains_key(&fixture.peer));
     }
     fixture.receive_join(9).await;
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborUp(fixture.peer)
+        Event::NeighborUp(tls_neighbor(fixture.peer))
     );
     fixture.shutdown().await;
 }
@@ -448,7 +468,7 @@ async fn closed_sender_input_is_rejected_before_the_connection_task_is_reaped() 
     assert!(fixture.events.try_recv().is_err());
     assert!(!fixture.actor.topics[&fixture.topic]
         .neighbors
-        .contains(&fixture.peer));
+        .contains_key(&fixture.peer));
     fixture.shutdown().await;
 }
 
@@ -511,11 +531,11 @@ async fn leaving_all_topics_cannot_queue_offline_broadcasts_for_replay() {
     }
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborUp(fixture.peer)
+        Event::NeighborUp(tls_neighbor(fixture.peer))
     );
     assert_eq!(
         second_events.try_recv().unwrap(),
-        ProtoEvent::NeighborUp(fixture.peer)
+        Event::NeighborUp(tls_neighbor(fixture.peer))
     );
 
     // Deliver both topics' final frames through the same registered connection.
@@ -573,11 +593,11 @@ async fn leaving_all_topics_cannot_queue_offline_broadcasts_for_replay() {
     assert!(fixture.actor.dialer.pending_dials.is_empty());
     assert_eq!(
         fixture.events.try_recv().unwrap(),
-        ProtoEvent::NeighborDown(fixture.peer)
+        Event::NeighborDown(tls_neighbor(fixture.peer))
     );
     assert_eq!(
         second_events.try_recv().unwrap(),
-        ProtoEvent::NeighborDown(fixture.peer)
+        Event::NeighborDown(tls_neighbor(fixture.peer))
     );
 
     let mut reconnected_outbound = fixture.activate_sender(8);

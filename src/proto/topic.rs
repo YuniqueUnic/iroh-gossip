@@ -112,6 +112,11 @@ impl<PI> Message<PI> {
     pub fn is_disconnect(&self) -> bool {
         matches!(self, Message::Swarm(hyparview::Message::Disconnect(_)))
     }
+
+    /// Whether this frame carries an explicit request to join this peer.
+    pub(crate) fn is_join(&self) -> bool {
+        matches!(self, Message::Swarm(hyparview::Message::Join(_)))
+    }
 }
 
 /// An event to be emitted to the application for a particular topic.

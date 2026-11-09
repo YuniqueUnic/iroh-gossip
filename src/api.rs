@@ -271,7 +271,7 @@ impl Stream for GossipTopic {
 pub struct GossipReceiver {
     #[debug("BoxStream")]
     stream: Pin<Box<dyn Stream<Item = Result<Event, ApiError>> + Send + Sync + 'static>>,
-    neighbors: HashSet<EndpointId>,
+    neighbors: HashSet<Neighbor>,
 }
 
 impl GossipReceiver {
@@ -286,6 +286,12 @@ impl GossipReceiver {
 
     /// Lists our current direct neighbors.
     pub fn neighbors(&self) -> impl Iterator<Item = EndpointId> + '_ {
+        self.neighbors.iter().map(|neighbor| neighbor.endpoint_id)
+    }
+
+    /// Authenticated membership from the same event stream and snapshot.
+    /// Applications compare principals; transport operations use Endpoint ids.
+    pub fn authenticated_neighbors(&self) -> impl Iterator<Item = Neighbor> + '_ {
         self.neighbors.iter().copied()
     }
 
@@ -316,11 +322,11 @@ impl Stream for GossipReceiver {
         let item = std::task::ready!(Pin::new(&mut self.stream).poll_next(cx));
         if let Some(Ok(item)) = &item {
             match item {
-                Event::NeighborUp(endpoint_id) => {
-                    self.neighbors.insert(*endpoint_id);
+                Event::NeighborUp(neighbor) => {
+                    self.neighbors.insert(*neighbor);
                 }
-                Event::NeighborDown(endpoint_id) => {
-                    self.neighbors.remove(endpoint_id);
+                Event::NeighborDown(neighbor) => {
+                    self.neighbors.remove(neighbor);
                 }
                 _ => {}
             }
@@ -335,27 +341,22 @@ impl Stream for GossipReceiver {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub enum Event {
     /// We have a new, direct neighbor in the swarm membership layer for this topic.
-    NeighborUp(EndpointId),
+    NeighborUp(Neighbor),
     /// We dropped direct neighbor in the swarm membership layer for this topic.
-    NeighborDown(EndpointId),
+    NeighborDown(Neighbor),
     /// We received a gossip message for this topic.
     Received(Message),
     /// We missed some messages because our [`GossipReceiver`] was not progressing fast enough.
     Lagged,
 }
 
-impl From<crate::proto::Event<EndpointId>> for Event {
-    fn from(event: crate::proto::Event<EndpointId>) -> Self {
-        match event {
-            crate::proto::Event::NeighborUp(endpoint_id) => Self::NeighborUp(endpoint_id),
-            crate::proto::Event::NeighborDown(endpoint_id) => Self::NeighborDown(endpoint_id),
-            crate::proto::Event::Received(message) => Self::Received(Message {
-                content: message.content,
-                scope: message.scope,
-                delivered_from: message.delivered_from,
-            }),
-        }
-    }
+/// Authenticated membership relationship, independent of one sender connection.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub struct Neighbor {
+    /// Transport endpoint of this direct neighbor.
+    pub endpoint_id: EndpointId,
+    /// Authenticated application key, or the TLS key without an authenticator.
+    pub principal: iroh_base::PublicKey,
 }
 
 /// A gossip message
