@@ -864,6 +864,7 @@ impl Actor {
             Entry::Vacant(entry) => {
                 entry.insert(PeerState {
                     external_reservations: HashSet::new(),
+                    pending_join_topics: BTreeSet::new(),
                     connection: PeerConnectionState::Active {
                         principal,
                         active_send_tx: send_tx,
@@ -901,6 +902,25 @@ impl Actor {
             }
         };
 
+        // A retired connection may have written a Join that never reached the
+        // remote actor. Retain only existing membership intents, excluding Joins
+        // already queued for this connection. This also covers a reservation
+        // whose old connection closed before the replacement was admitted.
+        let queued_joins = queue
+            .iter()
+            .filter_map(|message| message.message.is_join().then_some(message.topic))
+            .collect::<BTreeSet<_>>();
+        let rejoin_topics = self
+            .topics
+            .iter()
+            .filter_map(|(topic, state)| {
+                let pending = self.peers[&peer_id].pending_join_topics.contains(topic);
+                (state.still_needed()
+                    && !queued_joins.contains(topic)
+                    && (pending || state.neighbors.contains_key(&peer_id)))
+                .then_some(*topic)
+            })
+            .collect::<Vec<_>>();
         let max_message_size = self.state.max_message_size();
         let in_event_tx = self.in_event_tx.clone();
 
@@ -922,6 +942,13 @@ impl Actor {
             }
             .instrument(error_span!("conn", peer = %peer_id.fmt_short())),
         );
+        for topic in rejoin_topics {
+            debug!(%topic, peer = %peer_id.fmt_short(), conn_id, "rejoin after gossip connection handoff");
+            self.handle_in_event(
+                InEvent::Command(topic, ProtoCommand::Join(vec![peer_id])),
+                Instant::now(),
+            );
+        }
         Ok(activated)
     }
 
@@ -1040,6 +1067,9 @@ impl Actor {
                 Instant::now(),
             );
             if self.topics.remove(&topic_id).is_some() {
+                for peer in self.peers.values_mut() {
+                    peer.pending_join_topics.remove(&topic_id);
+                }
                 tracing::debug!(%topic_id, "publishers and subscribers gone; unsubscribing");
             }
         }
@@ -1062,6 +1092,14 @@ impl Actor {
             match event {
                 OutEvent::SendMessage(peer_id, message) => {
                     let state = self.peers.entry(peer_id).or_default();
+                    if message.message.is_join()
+                        && self
+                            .topics
+                            .get(&message.topic)
+                            .is_some_and(|topic| !topic.neighbors.contains_key(&peer_id))
+                    {
+                        state.pending_join_topics.insert(message.topic);
+                    }
                     match state.send_or_queue(message) {
                         PeerSendOutcome::Sent | PeerSendOutcome::Queued => {}
                         PeerSendOutcome::DroppedData => {
@@ -1144,8 +1182,9 @@ impl Actor {
                         ProtoEvent::NeighborUp(endpoint_id) => {
                             let Some(PeerState {
                                 connection: PeerConnectionState::Active { principal, .. },
+                                pending_join_topics,
                                 ..
-                            }) = self.peers.get(&endpoint_id)
+                            }) = self.peers.get_mut(&endpoint_id)
                             else {
                                 warn!(%endpoint_id, "membership has no admitted connection");
                                 out.extend(self.state.handle(
@@ -1159,6 +1198,7 @@ impl Actor {
                                 endpoint_id,
                                 principal: *principal,
                             };
+                            pending_join_topics.remove(&topic_id);
                             neighbors.insert(endpoint_id, neighbor);
                             Event::NeighborUp(neighbor)
                         }
@@ -1250,10 +1290,12 @@ impl Actor {
                     // this same physical connection. Retiring the old neighbor
                     // must not erase that independent application intent.
                     if let Some(PeerState {
+                        pending_join_topics,
                         connection: PeerConnectionState::Pending { queue, .. },
                         ..
                     }) = self.peers.get(&peer_id)
                     {
+                        topics.extend(pending_join_topics.iter().copied());
                         topics.extend(queue.iter().filter_map(|message| {
                             message.message.is_join().then_some(message.topic)
                         }));
@@ -1295,6 +1337,9 @@ struct PeerState {
     // Reservations belong to operations, independently of the live connection.
     // Another probe may still be waiting when an active connection is replaced.
     external_reservations: HashSet<ReservationId>,
+    // Initial Join intents until NeighborUp, scoped to the live topic and peer.
+    // A successful physical handoff must not lose an unacknowledged handshake.
+    pending_join_topics: BTreeSet<TopicId>,
     connection: PeerConnectionState,
 }
 
@@ -1421,7 +1466,9 @@ impl PeerState {
             return ExternalConnectionRelease::None;
         }
         match &mut self.connection {
-            PeerConnectionState::Pending { queue, .. } if queue.is_empty() => {
+            PeerConnectionState::Pending { queue, .. }
+                if queue.is_empty() && self.pending_join_topics.is_empty() =>
+            {
                 ExternalConnectionRelease::Remove
             }
             PeerConnectionState::Pending { dial_ownership, .. } => {
@@ -1880,6 +1927,7 @@ pub(crate) mod tests {
         drop(active_send_rx);
         let mut state = PeerState {
             external_reservations: HashSet::new(),
+            pending_join_topics: BTreeSet::new(),
             connection: PeerConnectionState::Active {
                 principal: SecretKey::from_bytes(&[2u8; 32]).public(),
                 active_send_tx,
@@ -2009,6 +2057,7 @@ pub(crate) mod tests {
         let (active_send_tx, _active_send_rx) = mpsc::channel(1);
         let mut state = PeerState {
             external_reservations: HashSet::new(),
+            pending_join_topics: BTreeSet::new(),
             connection: PeerConnectionState::Active {
                 principal: SecretKey::from_bytes(&[2u8; 32]).public(),
                 active_send_tx,
@@ -2132,6 +2181,7 @@ pub(crate) mod tests {
         let (active_send_tx, _active_send_rx) = mpsc::channel(1);
         let mut state = PeerState {
             external_reservations: HashSet::new(),
+            pending_join_topics: BTreeSet::new(),
             connection: PeerConnectionState::Active {
                 principal: SecretKey::from_bytes(&[2u8; 32]).public(),
                 active_send_tx,

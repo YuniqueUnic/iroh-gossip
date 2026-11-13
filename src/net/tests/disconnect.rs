@@ -54,6 +54,7 @@ impl Fixture {
             self.peer,
             PeerState {
                 external_reservations: HashSet::new(),
+                pending_join_topics: BTreeSet::new(),
                 connection: PeerConnectionState::Active {
                     principal: self.peer,
                     active_send_tx,
@@ -215,6 +216,7 @@ async fn disconnect_preserves_external_ownership_but_discards_retired_messages()
         fixture.peer,
         PeerState {
             external_reservations: HashSet::from([ReservationId(1)]),
+            pending_join_topics: BTreeSet::new(),
             connection: PeerConnectionState::Pending {
                 queue: vec![test_proto_message()],
                 dial_ownership: DialOwnership::Idle,
@@ -233,6 +235,7 @@ async fn disconnect_preserves_external_ownership_but_discards_retired_messages()
         matches!(fixture.actor.peers.get(&fixture.peer), Some(PeerState {
             external_reservations,
             connection: PeerConnectionState::Pending { queue, dial_ownership: DialOwnership::Idle },
+            ..
         }) if queue.is_empty() && external_reservations == &HashSet::from([ReservationId(1)]))
     );
     fixture.actor.handle_in_event(
@@ -243,6 +246,7 @@ async fn disconnect_preserves_external_ownership_but_discards_retired_messages()
         matches!(fixture.actor.peers.get(&fixture.peer), Some(PeerState {
             external_reservations,
             connection: PeerConnectionState::Pending { queue, dial_ownership: DialOwnership::Idle },
+            ..
         }) if queue.len() == 1 && external_reservations == &HashSet::from([ReservationId(1)]))
     );
     assert!(fixture.actor.dialer.pending_dials.is_empty());
